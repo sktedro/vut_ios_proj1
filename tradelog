@@ -1,0 +1,283 @@
+#!/bin/sh
+export POSIXLY_CORRECT=yes
+export LC_NUMERIC=en_US.UTF-8
+
+DELIM=";"
+AFTER="0000-00-00 00:00:00"
+BEFORE="9999-00-00 00:00:00"
+
+HELP='This is a help message.\n
+\tCommands:
+list-tick: Prints all tickers that the files contain
+profit: Prints overall profit of closed orders
+pos: Prints open orders
+last-price: Prints last known price for tickers contained in input files
+hist-ord: Prints histogram of transactions count for each ticker
+graph-pos: Prints a graph of open orders\n
+\tFilters:
+-a \"YYYY-MM-DD HH:MM:SS\": Only process records after the inserted date
+-b \"YYYY-MM-DD HH:MM:SS\": Only process records before the inserted date
+-t TICKER: Only process records containing this ticker. Can be used repeatedly
+-w WIDTH: Sets max width for histograms and graphs\n
+\tOther:
+-h --help: Show this help\n'
+
+usage() { echo "Usage: $0 [-h|--help] [filters] [command] [log [log2 [...]]"; }
+getCommand() { 
+  if [ -n "$COMMAND" ]; then
+    echo "Multiple commands detected. Only one is allowed. Exiting." >&2
+    usage; exit 1
+  fi
+  COMMAND=$1
+}
+
+while true; do
+  case $1 in
+    "list-tick")
+      getCommand "$1"; shift;;
+    "profit")
+      getCommand "$1"; shift;;
+    "pos")
+      getCommand "$1"; shift;;
+    "last-price")
+      getCommand "$1"; shift;;
+    "hist-ord")
+      getCommand "$1"; shift;;
+    "graph-pos")
+      getCommand "$1"; shift;;
+
+    "-h")
+      echo "$HELP"; usage; exit 0;;
+    "-a")
+      AFTER=$2; shift; shift;;
+    "-b")
+      BEFORE=$2; shift; shift;;
+    "-t")
+      TICKER=$TICKER$2"\n"
+      shift; shift;;
+    "-w")
+      if [ -n "$WIDTH" ]; then
+        echo "Multiple -w options detected. Exiting." >&2
+        usage; exit 1
+      fi
+      WIDTH=$2
+      if [ ! "$(echo "$WIDTH" | awk '$0 ~ /^[0-9]+$/')" ]; then
+        echo "The -w option's argument must be a positive integer. Exiting." >&2
+        usage; exit 1
+      fi
+      shift; shift;;
+
+    "")
+      if [ -z "$1" ]; then break; fi;;
+
+    *)
+      FILE=$1
+      if [ ! -f "$FILE" ]; then
+        echo "The $FILE does not exist or is not a name of a log. Exiting" >&2
+        exit 1
+      fi
+      #If the file is compressed, read it with zcat
+      if [ "${FILE##*\.}" = "gz" ]; then
+        LOGS=$LOGS$(zcat "$FILE")'\n'
+      else
+        LOGS=$LOGS$(cat "$FILE")'\n'
+      fi
+      shift
+  esac
+done
+
+#If there is no filename as an argument, read from stdin. 
+#However, in both cases remove '\r'
+if [ -z "$FILE" ]; then
+  LOGS=$(tr -d '\r' <&0 )
+else
+  LOGS=$(printf "%b" "$LOGS" | tr -d '\r')
+fi
+
+#Filter logs based on -a and -b
+LOGS=$(printf "%b" "$LOGS" | awk -v a="$AFTER" -v b="$BEFORE" -F $DELIM \
+  '{ if ($1 > a) if ($1 < b) {print $0 } }')
+
+#If no -t argument is inserted, work for all tickers
+if [ -z "$TICKER" ]; then
+  TICKER=";"$(printf "%b" "$LOGS" | awk -F $DELIM '{printf $2 "\n"}' | \
+    sort -u | tr '\n' ';')
+else 
+  TICKER=$DELIM$(printf "%b" "$TICKER" | sort -u | tr '\n' ';')
+fi
+
+#Filter logs based on -t
+LOGS=$(printf "%b" "$LOGS" | awk -v t="$TICKER" -F ";" 't ~ $2";" {print $0}')
+
+#Used to loop through tickers - gets a ticker and removes it from a list
+getNextTicker () {
+  ACTTICK=$(printf "%s" "$TICKER" | cut -d $DELIM -f 2)
+  TICKER=";"$(printf "%s" "$TICKER" | cut -f 3- -d $DELIM)
+}
+
+#Removes all data in a variable expect the first line
+getLastRecord () {
+  sort -g -r | head -n 1
+}
+
+#Reverse sort and pick the newest lines for each ticker
+getLastLogs () {
+  LASTLOGS=$(printf "%b" "$LOGS" | sort -r -t $DELIM -k 1,1 | \
+    sort -u -t $DELIM -k 2,2) 
+}
+
+#For a single ticker calculates total amount bought and sold and also reads 
+#the last known price
+getOpenPos () {
+  getNextTicker
+  BUY=$(printf "%b" "$LOGS" | grep ";$ACTTICK;" | grep buy | \
+    awk -F $DELIM '{buy = buy + $6; printf "%.2f\n", buy}' | getLastRecord)
+  SELL=$(printf "%b" "$LOGS" | grep ";$ACTTICK;" | grep sell | \
+    awk -F $DELIM '{sell = sell + $6; printf "%.2f\n", sell}' | getLastRecord)
+  LASTPRICE=$(printf "%b" "$LASTLOGS" | grep ";$ACTTICK;" | \
+    awk -F $DELIM '{printf "%.2f\n", $4}') #Format the data
+}
+
+#Align all numbers based on the longest number
+alignNumbers () {
+DATA=$(printf "%b" "$DATA" | awk -F':' -v l="$LONGEST" '{
+    if(length($0) > 1){
+      printf "%s:", $1
+      i = 1
+      while(l > length($2) + i) {
+        printf " "
+        i++
+      }
+      print $2
+    }
+  }')
+}
+
+#Executing the commands
+case "${COMMAND}" in
+
+  "list-tick")
+    echo "$TICKER" | rev | cut -c2- | rev | cut -c2- | tr ";" "\n"
+    ;;
+
+
+  "profit")
+    #Calculate total amount bought and sold in dollars, print the difference
+    BUY=$(printf "%b" "$LOGS" | grep buy | \
+      awk -F $DELIM '{buy = buy+($4*$6); printf "%.2f\n", buy}' | \
+      getLastRecord)
+    SELL=$(printf "%b" "$LOGS" | grep sell | \
+      awk -F $DELIM '{sell = sell+($4*$6); printf "%.2f\n", sell}' | \
+      getLastRecord)
+    awk -v b="$BUY" -v s="$SELL" 'BEGIN {printf "%.2f\n", (s - b)}'
+    ;;
+
+
+  "pos")
+    getLastLogs
+    #For every ticker calculate the actual position
+    while [ ! "$TICKER" = ";" ]; do
+      getOpenPos
+      ACTPOS=$( \
+        awk -v b="$BUY" -v s="$SELL" -v l="$LASTPRICE" -v t="$ACTTICK" \
+        'BEGIN {printf "%-10s:%.2f\\n", t, (b - s) * l}')
+      POS=$POS$ACTPOS
+      #Get length of the longest number
+      LONGEST=$(printf "%b" "$ACTPOS\n" | cut -d ":" -f2,2 | wc -c | \
+        awk -v l="$LONGEST" '{if($0 > l) print $0; else print l}')
+    done
+    DATA="$POS"
+    alignNumbers
+    printf "%b" "$DATA" | sort -t ":" -k 2,2 -g -r | grep -v " 0.00"
+    ;;
+
+
+  "last-price")
+    getLastLogs
+    #Format the data
+    DATA=$(printf "%b" "$LASTLOGS" | \
+      awk -F $DELIM '{printf "%-10s: %s\n", $2, $4}')
+    LONGEST=$(printf "%b" "$DATA" | cut -d ":" -f2 | \
+      awk '{printf "%s\n", length($0) + 1}' | sort -u -r | head -n 1)
+    alignNumbers
+    printf "%b" "$DATA"
+    ;;
+
+
+  "hist-ord")
+    #Get tickers and numbers of their occurances
+    while [ ! "$TICKER" = ";" ]; do
+      getNextTicker
+      ORD="$ORD$ACTTICK;""$(printf "%b" "$LOGS" | grep -c ";$ACTTICK;")""\n"
+    done
+
+    #Get the highest value, calculate the divisor and get all data into one line
+    DIVISOR=1
+    if [ -n "$WIDTH" ]; then
+      HIGHEST=$(printf "%b" "$ORD" | sort -t $DELIM -k2,2 -g -r | \
+        awk -F $DELIM '{printf $2";"}' | cut -d $DELIM -f 1)
+      DIVISOR=$(awk -v h="$HIGHEST" -v w="$WIDTH" 'BEGIN{printf "%f", (h / w)}')
+    fi
+    ORD=$(printf "%b" "$ORD" | \
+      awk -F $DELIM -v d="$DIVISOR" '{printf $1 ";" ($2 / d) ";"}')
+
+    #Get first line (ticker and position), loop to write it in #'s and delete it
+    while [ -n "$(printf "%b" "$ORD" | cut -d $DELIM -f 1)" ]; do
+      COUNT=0; HASHES=""
+      NUM=$(printf "%b" "$ORD" | cut -d $DELIM -f 2 | cut -f 1 -d '.')
+      while [ "$COUNT" -lt "$NUM" ]; do
+        HASHES=$HASHES"#"; COUNT=$((COUNT+1)); done
+      printf "%-10s: %s\n" "$(printf "%b" "$ORD" | cut -d $DELIM -f 1)" "$HASHES"
+      ORD=$(printf "%b" "$ORD" | cut -d $DELIM -f 3-)
+    done
+    ;;
+
+
+  "graph-pos")
+    getLastLogs
+    #Get open positions
+    while [ ! "$TICKER" = ";" ]; do
+      getOpenPos
+      POS=$POS$(awk -v b="$BUY" -v s="$SELL" -v l="$LASTPRICE" -v t="$ACTTICK" \
+        'BEGIN {printf "%s;%f\\n", t, (b - s) * l}')
+    done
+    #Just delete the unnecessary new line at the end
+    POS=$(printf "%b" "$POS" | rev | cut -c2- | rev) 
+
+    #Calculate the divisor for -w option and divide the numbers
+    DIVISOR=1000.0
+    if [ -n "$WIDTH" ]; then
+      LOWEST=$(printf "%b" "$POS" | sort -t $DELIM -k2,2 -g | \
+        awk -F $DELIM '{printf $2";"}' | cut -f 1 -d $DELIM | cut -c2-)
+      HIGHEST=$(printf "%b" "$POS" | sort -t $DELIM -k2,2 -g -r |  \
+        awk -F $DELIM '{printf $2";"}' | cut -f 1 -d $DELIM)
+      HIGHEST=$(awk -v l="$LOWEST" -v h="$HIGHEST" \
+        'BEGIN {if (h > l) print h; else print l}')
+      DIVISOR=$(awk -v h="$HIGHEST" -v w="$WIDTH" 'BEGIN {printf "%f", (h / w)}')
+    fi
+    POS=$(printf "%b" "$POS" | awk -F $DELIM -v d="$DIVISOR" -v w="$WIDTH" \
+      '{printf "%s;%f\n", $1, ($2/d)}' | tr '\n' ';')
+
+    #Get first line (ticker and position), loop to write it in #/! and delete it
+    while [ -n "$POS" ]; do
+      COUNT=0; HASHES=""
+      NUM=$(printf "%b" "$POS" | cut -d $DELIM -f 2 | cut -f 1 -d '.')
+      #Only print a space if at least one '#' or '!' is to be written
+      if [ "$COUNT" -lt "$NUM" ] || [ "$NUM" -lt "$COUNT" ]; then
+        HASHES=" "
+      fi
+      while [ "$COUNT" -lt "$NUM" ]; do
+        HASHES=$HASHES"#"; COUNT=$((COUNT+1)); done
+      while [ "$NUM" -lt "$COUNT" ]; do
+        HASHES=$HASHES"!"; COUNT=$((COUNT-1)); done
+      printf '%-10s:%s\n' "$(printf "%b" "$POS" | cut -d $DELIM -f1)" "$HASHES"
+      POS=$(printf "%b\n" "$POS" | cut -d $DELIM -f 3-)
+    done
+    ;;
+
+
+  "")
+    printf "%b\n" "$LOGS"
+    ;;
+
+esac
